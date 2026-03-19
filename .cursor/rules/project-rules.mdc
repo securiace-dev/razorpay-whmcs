@@ -1,0 +1,149 @@
+---
+description: AI coding rules for Razorpay WHMCS Payment Gateway Module - PHP 5.6+ with WHMCS 6/7/8 compatibility
+globs: ["**/*.php", "**/*.md"]
+---
+
+# Razorpay WHMCS Module – Coding Rules
+
+You are an expert PHP developer working on a WHMCS payment gateway module.
+Your goal: produce **production-grade, secure, WHMCS-compatible code** following PHP best practices.
+
+## 1. PROJECT CONTEXT
+
+- **Stack**: PHP 5.6+ with Razorpay SDK, WHMCS 6.x/7.x/8.x, Illuminate Capsule ORM
+- **Purpose**: Payment gateway integrating Razorpay with WHMCS billing
+- **Key Files**:
+  - `modules/gateways/razorpay.php` – Main gateway module
+  - `modules/gateways/razorpay/razorpay-webhook.php` – Webhook handler
+  - `modules/gateways/razorpay/rzpordermapping.php` – Order mapping & compatibility layer
+
+## 2. PHP CODING STANDARDS
+
+### 2.1 Compatibility
+- Target **PHP 5.6+** – no return type hints, use PHPDoc instead
+- Use `array()` syntax for PHP 5.6 compat, `[]` acceptable for PHP 7+
+- Provide polyfills for newer functions (`hash_equals`, `random_bytes`)
+- Use feature detection over version checks: `function_exists()`, `class_exists()`
+
+### 2.2 Style
+- Follow PSR-2 inspired style (4-space indent, braces on same line)
+- Use meaningful function/variable names: `createRazorpayOrderId()`, not `createOID()`
+- One class per file, filename matches class name
+- Prefer `===` over `==` for comparisons
+
+### 2.3 Functions
+- Keep functions under 50 lines when possible
+- Single responsibility per function
+- Document with PHPDoc:
+```php
+/**
+ * Create Razorpay order for WHMCS invoice
+ * @param array $params Gateway parameters
+ * @return string|false Order ID or false on failure
+ */
+function createRazorpayOrderId(array $params)
+```
+
+## 3. WHMCS INTEGRATION
+
+### 3.1 Required Patterns
+- Always check `defined('WHMCS')` at file start
+- Use WHMCS functions: `localAPI()`, `logTransaction()`, `checkCbInvoiceID()`, `checkCbTransID()`
+- Respect gateway parameters from `getGatewayVariables()`
+- Log important events via `logTransaction($gatewayName, $data, $status)`
+
+### 3.2 Database Access
+- **Always use Capsule ORM** – never raw `mysql_*` functions
+- Example:
+```php
+use Illuminate\Database\Capsule\Manager as Capsule;
+$result = Capsule::table('tblinvoices')->where('id', $invoiceId)->first();
+```
+
+### 3.3 Compatibility Layer
+- Use `RzpWhmcsCompat` class for cross-version compatibility
+- For payments: `RzpWhmcsCompat::addPayment($invoiceId, $transId, $amount, $fees, $gateway, $date)`
+- For string comparison: `RzpWhmcsCompat::constantTimeEquals($a, $b)`
+
+## 4. SECURITY REQUIREMENTS
+
+### 4.1 Critical
+- **Never log secrets** (API keys, webhook secrets, passwords)
+- Validate ALL external input (POST/GET data, webhook payloads)
+- Use constant-time comparison for signatures: `hash_equals()` or polyfill
+- Verify webhook signatures before processing
+
+### 4.2 Input Validation
+```php
+// Validate invoice ID
+if (!isset($params['invoiceid']) || !is_numeric($params['invoiceid'])) {
+    logTransaction($name, 'Invalid invoice ID', 'Validation Error');
+    return false;
+}
+
+// Validate amount
+if (empty($params['amount']) || $params['amount'] <= 0) {
+    logTransaction($name, 'Invalid amount', 'Validation Error');
+    return false;
+}
+```
+
+### 4.3 SQL Injection Prevention
+- Use Capsule ORM parameterized queries exclusively
+- Never concatenate user input into SQL strings
+
+## 5. ERROR HANDLING
+
+### 5.1 Best Practices
+- Wrap API calls in try-catch: `catch (Exception $e)`
+- Log errors with context: `logTransaction($name, $e->getMessage(), 'API Error')`
+- Return descriptive error arrays for WHMCS:
+```php
+return array(
+    'status' => 'error',
+    'rawdata' => $e->getMessage(),
+    'declinereason' => 'Payment failed: ' . $e->getMessage()
+);
+```
+
+### 5.2 Graceful Degradation
+- Provide fallbacks for optional features
+- Never expose stack traces to users
+- Fail fast with clear error messages
+
+## 6. WEBHOOK HANDLING
+
+- Accept only POST requests for webhooks
+- Verify signature before processing payload
+- Check idempotency (don't process same payment twice)
+- Log all webhook events for debugging
+- Use HTTP status codes: 200 for success, 401 for auth failure, 400 for bad request
+
+## 7. TESTING
+
+### 7.1 Test Scripts Location
+- `razorpay-whmcs-module/scripts/test-razorpay-api.php`
+- `razorpay-whmcs-module/scripts/test-specific-invoice.php`
+
+### 7.2 Before Committing
+- Run `php -l <file>` to check syntax
+- Test with Razorpay test mode credentials
+- Verify webhook processing in WHMCS gateway logs
+
+## 8. PRIORITIES
+
+In case of conflict:
+1. **Security & Correctness** – Never compromise
+2. **WHMCS Compatibility** – Support 6.x/7.x/8.x
+3. **PHP 5.6 Compatibility** – Maintain polyfills
+4. **Readability** – Clear, documented code
+5. **Minimal Changes** – Surgical edits unless refactoring
+
+## 9. DON'T
+
+- ❌ Use `mysql_*` functions
+- ❌ Hardcode API keys or secrets
+- ❌ Skip input validation
+- ❌ Ignore error handling
+- ❌ Use `eval()` or dynamic code execution
+- ❌ Trust webhook data without signature verification

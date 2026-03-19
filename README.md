@@ -1,43 +1,157 @@
-## Razorpay Payment Extension for WHMCS
+# Razorpay Payment Gateway for WHMCS
 
-Allows you to use Razorpay payment gateway with the WHMCS Store.
+[![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![WHMCS](https://img.shields.io/badge/WHMCS-6.x%20|%207.x%20|%208.x-blue.svg)](https://www.whmcs.com)
+[![PHP](https://img.shields.io/badge/PHP-5.6%2B-purple.svg)](https://php.net)
 
-## Description
+A production-ready Razorpay payment gateway integration for WHMCS, enabling Indian merchants to accept credit cards, debit cards, netbanking, UPI, and wallet payments seamlessly.
 
-​This is the Razorpay payment gateway plugin for WHMCS. Allows Indian merchants to accept credit cards, debit cards, netbanking and wallet payments with the WHMCS store. It uses a seamless integration, allowing the customer to pay on your website without being redirected away from your WHMCS website.
+## ✨ Features
 
-## Downloads: [whmcs-6 / whmcs-7 / whmcs-8][6] [whmcs-5][5]
+- **Multi-WHMCS Support** – Compatible with WHMCS 6.x, 7.x, 8.x, and 9.x
+- **PHP 5.6+ Compatible** – Graceful fallbacks for older PHP versions
+- **Webhook Processing** – Automatic payment confirmation and recording
+- **Full & Partial Refunds** – Process refunds directly from WHMCS
+- **Multi-Currency** – Support for INR, USD, EUR, GBP, and more
+- **Gateway Fee Handling** – Merchant absorbs or client pays options
+- **Secure** – PCI compliant, offsite processing, signature verification
 
-## Installation
+## 📦 Directory Structure
 
-1. Ensure you have latest version of WHMCS installed.
-2. Download the zip of this repo.
-3. Upload the contents of the repo to your WHMCS Installation directory (content of module folder goes in module folder).
+```
+razorpay-whmcs/
+├── modules/gateways/
+│   ├── razorpay.php                 # Main gateway module
+│   ├── callback/razorpay.php        # Payment callback handler
+│   └── razorpay/
+│       ├── razorpay-webhook.php     # Webhook processor
+│       ├── rzpordermapping.php      # Order mapping utility
+│       ├── lib/razorpay-sdk/        # Official Razorpay PHP SDK
+│       └── README.md                # Module documentation
+├── razorpay-whmcs-module/           # Distributable package
+│   ├── CHANGELOG.md
+│   ├── INSTALLATION.md
+│   └── scripts/                     # Utility & test scripts
+├── AGENT.md                         # AI coding guidelines
+└── .cursor/rules/                   # Cursor AI rules
+```
 
-## Branches
+## 🚀 Quick Start
 
- - Use the `master` branch if you are on WHMCS 6 or WHMCS 7 or WHMCS 8
- - Use the `whmcs-5` branch if you are on WHMCS 5
+### Prerequisites
 
-## Configuration
+- WHMCS 6.0+ installed and running
+- PHP 5.6+ with cURL extension
+- SSL certificate (required for webhooks)
+- [Razorpay account](https://dashboard.razorpay.com/signup) with API keys
 
-1. Log into WHMCS as administrator (http://whmcs_installation/admin).
-2. Navigate to Setup->Payments->Payment Gateways.
-3. Choose Razorpay in the Activate dropdown and Activate it
-4. Fill the Key Id and Key Secret.
-5. Choose Convert for Processing to INR if your store has a different default currency. Make sure you update the exchange rate in that case in your currency management.
-6. Click 'Save Changes'
+### Installation
 
-### Support
+1. **Download** the latest release or clone this repository
+2. **Upload** module files to your WHMCS installation:
+   ```bash
+   cp modules/gateways/razorpay.php /path/to/whmcs/modules/gateways/
+   cp modules/gateways/callback/razorpay.php /path/to/whmcs/modules/gateways/callback/
+   cp -r modules/gateways/razorpay /path/to/whmcs/modules/gateways/
+   ```
+3. **Configure** in WHMCS Admin → Setup → Payments → Payment Gateways
 
-Visit [https://razorpay.com](https://razorpay.com) for support requests or email <integrations@razorpay.com>.
+### Configuration
 
-### License
+| Setting                  | Description                                                                  |
+| ------------------------ | ---------------------------------------------------------------------------- |
+| **Key ID**               | Your Razorpay Key ID ([Get keys](https://dashboard.razorpay.com/#/app/keys)) |
+| **Key Secret**           | Your Razorpay Key Secret                                                     |
+| **Webhook Secret**       | Secret for webhook signature verification                                    |
+| **Enable Webhook**       | Must be **Yes** for payments to be recorded                                  |
+| **Gateway Fee Mode**     | Merchant absorbs (default) or Client pays                                    |
+| **Supported Currencies** | Comma-separated list (e.g., `INR,USD,EUR`)                                   |
 
-This is licensed under the [MIT License][mit]
+## ⚡ Webhook Setup (Critical)
 
-[mit]: https://opensource.org/licenses/MIT
-[8]: https://github.com/razorpay/razorpay-whmcs/releases/tag/2.2.2
-[7]: https://github.com/razorpay/razorpay-whmcs/releases/tag/2.2.1
-[6]: https://github.com/razorpay/razorpay-whmcs/releases/tag/2.2.0
-[5]: https://github.com/razorpay/razorpay-whmcs/releases/tag/v1.0.3
+> ⚠️ **Without webhooks, payments will NOT be recorded in WHMCS!**
+
+1. Go to [Razorpay Dashboard → Settings → Webhooks](https://dashboard.razorpay.com/#/app/webhooks)
+2. Click **Add New Webhook**
+3. Enter URL: `https://yourdomain.com/modules/gateways/razorpay/razorpay-webhook.php`
+4. Select events:
+   - ✅ `payment.captured`
+   - ✅ `order.paid`
+   - ✅ `refund.created`
+   - ✅ `refund.processed`
+5. Copy the webhook secret to WHMCS gateway configuration
+
+## 🧪 Testing
+
+Use Razorpay test mode credentials and test cards:
+
+| Card Number           | Result  |
+| --------------------- | ------- |
+| `4111 1111 1111 1111` | Success |
+| `4000 0000 0000 0002` | Failure |
+
+Verify in: WHMCS Admin → Utilities → Logs → Gateway Log
+
+## 🔧 Utility Scripts
+
+```bash
+# Sync payments from Razorpay
+php modules/gateways/razorpay/scripts/sync-payments.php --since=2025-01-01
+
+# Webhook diagnostics
+php modules/gateways/razorpay/scripts/webhook-diagnostic.php
+
+# Cross-check payments
+php modules/gateways/razorpay/scripts/cross-check-tool.php
+```
+
+## 🔍 Troubleshooting
+
+| Issue                         | Solution                                     |
+| ----------------------------- | -------------------------------------------- |
+| Payments not recorded         | Verify webhook is enabled and URL is correct |
+| Signature verification failed | Check webhook secret matches in both places  |
+| Currency not supported        | Add currency to supported currencies list    |
+
+For detailed troubleshooting, see [INSTALLATION.md](razorpay-whmcs-module/INSTALLATION.md#troubleshooting).
+
+## 📖 Documentation
+
+- [Installation Guide](razorpay-whmcs-module/INSTALLATION.md)
+- [Changelog](razorpay-whmcs-module/CHANGELOG.md)
+- [Module README](modules/gateways/razorpay/README.md)
+- [Razorpay API Docs](https://razorpay.com/docs/)
+- [WHMCS Gateway Development](https://developers.whmcs.com/payment-gateways/)
+
+### Optional: Affordability Widget
+
+To surface Razorpay EMI² affordability information on product or cart pages:
+
+- Enable **Affordability Widget** and set **Affordability Widget Key** in the Razorpay gateway settings.
+- Ensure your active WHMCS theme includes a container where the widget should render, for example:
+
+```html
+<div id="razorpay-affordability-widget"></div>
+```
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/amazing-feature`
+3. Follow the coding rules in [AGENT.md](AGENT.md)
+4. Test thoroughly with WHMCS test environment
+5. Submit a pull request
+
+## 📄 License
+
+This project is licensed under the MIT License – see [LICENSE](razorpay-whmcs-module/LICENSE) for details.
+
+## 🙏 Support
+
+- **Issues**: [GitHub Issues](https://github.com/razorpay/razorpay-whmcs/issues)
+- **Razorpay Support**: [integrations@razorpay.com](mailto:integrations@razorpay.com)
+- **Documentation**: [razorpay.com/docs](https://razorpay.com/docs/)
+
+---
+
+**Version**: 2.2.1 | **Tested on**: WHMCS 6.3, 7.10, 8.13 | **PHP**: 5.6, 7.4, 8.0, 8.1, 8.2

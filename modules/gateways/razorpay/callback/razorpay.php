@@ -25,7 +25,7 @@ $clientIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
 $rateLimitKey = 'razorpay_callback_' . md5($clientIp);
 if (function_exists('apcu_fetch')) {
     $rateLimitCount = apcu_fetch($rateLimitKey) ?: 0;
-    if ($rateLimitCount > 10) { // Max 10 requests per minute
+    if ($rateLimitCount >= 10) { // Max 10 requests per minute
         logActivity('Razorpay Callback Security: Rate limit exceeded for IP - ' . $clientIp);
         http_response_code(429);
         die('Too Many Requests');
@@ -270,17 +270,11 @@ if (!$gatewayParams['type'])
     die("Module Not Activated");
 }
 
-// Security: Validate referer to prevent CSRF attacks
-$referer = $_SERVER['HTTP_REFERER'] ?? '';
-$expectedReferer = $gatewayParams['systemurl'] ?? '';
-if (!empty($referer) && !empty($expectedReferer) && strpos($referer, $expectedReferer) !== 0) {
-    logActivity('Razorpay Callback Security: Invalid referer - ' . $referer);
-    http_response_code(403);
-    die('Forbidden');
-}
+// Note: Referer is not a reliable security control (often absent/spoofable).
+// We rely on Razorpay signature verification later for authenticity.
 
 // Retrieve data returned in payment gateway callback
-$merchant_order_id   = (isset($_POST['merchant_order_id']) === true) ? $_POST['merchant_order_id'] : $_GET['merchant_order_id'];
+$merchant_order_id   = $_POST['merchant_order_id'] ?? ($_GET['merchant_order_id'] ?? '');
 $razorpay_payment_id = $_POST['razorpay_payment_id'] ?? '';
 $razorpay_order_id   = $_POST['razorpay_order_id'] ?? '';
 $razorpay_signature  = $_POST['razorpay_signature'] ?? '';
@@ -411,7 +405,7 @@ function logRazorpayDebug($message, $context = []) {
     logActivity($logMessage);
 }
 
-// Enhanced debugging: Log all callback parameters
+// Debug logging: avoid storing signature and other sensitive payload fields in logs.
 logRazorpayDebug('Callback received', [
     'merchant_order_id' => $merchant_order_id,
     'razorpay_payment_id' => $razorpay_payment_id,
@@ -419,7 +413,6 @@ logRazorpayDebug('Callback received', [
     'signature_valid' => $signatureValid,
     'auto_fixes_applied' => $autoFixApplied,
     'request_method' => $_SERVER['REQUEST_METHOD'],
-    'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown'
 ]);
 
 /**
@@ -428,10 +421,29 @@ logRazorpayDebug('Callback received', [
 # Fetch invoice to get the amount and userid
 $result = RzpWhmcsCompat::safeQuery('tblinvoices', '*', array("id"=>$merchant_order_id));
 
-#check whether order is already paid or not, if paid then redirect to complete page
-if($result['status'] === 'Paid')
+/**
+ * Safe getter for WHMCS DB rows that may be array or stdClass.
+ *
+ * @param mixed  $row
+ * @param string $key
+ * @return mixed|null
+ */
+function rzpRowGet($row, $key)
 {
-    logRazorpayDebug('Invoice already paid', ['invoice_id' => $merchant_order_id, 'status' => $result['status']]);
+    if (is_array($row) && array_key_exists($key, $row)) {
+        return $row[$key];
+    }
+    if (is_object($row) && isset($row->$key)) {
+        return $row->$key;
+    }
+    return null;
+}
+
+#check whether order is already paid or not, if paid then redirect to complete page
+$invoiceStatus = rzpRowGet($result, 'status');
+if ($invoiceStatus === 'Paid')
+{
+    logRazorpayDebug('Invoice already paid', ['invoice_id' => $merchant_order_id, 'status' => $invoiceStatus]);
     header("Location: ".$gatewayParams['systemurl']."/viewinvoice.php?id=" . $merchant_order_id . "&paymentsuccess=1&already_paid=1"); // nosemgrep : php.lang.security.non-literal-header.non-literal-header
     
     exit;
@@ -443,8 +455,9 @@ $invoiceBalance = 0;
 
 try {
     // Get invoice total from database result
-    if (isset($result['total'])) {
-        $invoiceTotal = floatval($result['total']);
+    $dbTotal = rzpRowGet($result, 'total');
+    if ($dbTotal !== null) {
+        $invoiceTotal = floatval($dbTotal);
     } else {
         // Fallback: fetch from API
         $invoiceData = localAPI('GetInvoice', array('invoiceid' => $merchant_order_id));
@@ -456,7 +469,8 @@ try {
     }
     
     // Calculate balance (total - amount paid)
-    $amountPaid = isset($result['amountpaid']) ? floatval($result['amountpaid']) : 0;
+    $dbAmountPaid = rzpRowGet($result, 'amountpaid');
+    $amountPaid = ($dbAmountPaid !== null) ? floatval($dbAmountPaid) : 0;
     $invoiceBalance = $invoiceTotal - $amountPaid;
     
     logRazorpayDebug('Invoice balance calculated', [
@@ -480,23 +494,6 @@ try {
     }
 }
 
-# Validate payment amount against invoice balance
-if ($paymentAmount !== null && abs($paymentAmount - $invoiceBalance) > 0.01) {
-    logRazorpayDebug('Payment amount mismatch', [
-        'payment_amount' => $paymentAmount,
-        'invoice_balance' => $invoiceBalance,
-        'difference' => abs($paymentAmount - $invoiceBalance)
-    ]);
-    
-    // Use the larger amount to avoid underpayment issues
-    $finalAmount = max($paymentAmount, $invoiceBalance);
-    logRazorpayDebug('Using larger amount to avoid underpayment', ['final_amount' => $finalAmount]);
-} else {
-    $finalAmount = $paymentAmount !== null ? $paymentAmount : $invoiceBalance;
-}
-
-$amount = $finalAmount;
-
 $error = "";
 
 try
@@ -511,46 +508,38 @@ try
     
     // Calculate gateway fee based on fee mode and credit behavior settings
     $actualPaymentAmount = $paymentDetails['amount'] / 100;
-    $gatewayFee = 0;
-    $paymentAmount = $amount;
     $feeMode = $gatewayParams['feeMode'] ?? 'merchant_absorbs';
     $feeCreditBehavior = $gatewayParams['feeCreditBehavior'] ?? 'disabled';
+
+    // Prefer Razorpay’s explicit `fee` field. Using `payment.amount - invoiceBalance` can treat surcharge/optimizer components as "gateway fee".
+    $razorpayFeeRuples = 0;
+    if (isset($paymentDetails['fee']) && $paymentDetails['fee'] !== null) {
+        $razorpayFeeRuples = ((float) $paymentDetails['fee']) / 100;
+    } else {
+        // Fallback for unexpected/missing fee fields.
+        $razorpayFeeRuples = max(0, $actualPaymentAmount - $invoiceBalance);
+    }
+
+    $gatewayFee = 0;
+    if ($feeMode === 'client_pays') {
+        // Client bears the fee: apply only the invoice balance as payment, keep `fees` at 0.
+        $paymentAmount = $invoiceBalance;
+        $gatewayFee = 0;
+    } else {
+        // Merchant absorbs the fee: record base amount, keep `fees` as Razorpay fee.
+        $paymentAmount = $invoiceBalance;
+        $gatewayFee = $razorpayFeeRuples;
+    }
     
     logRazorpayDebug('Fee calculation started', [
         'actual_payment_amount' => $actualPaymentAmount,
-        'invoice_amount' => $amount,
+        'invoice_balance' => $invoiceBalance,
         'fee_mode' => $feeMode,
-        'fee_credit_behavior' => $feeCreditBehavior
+        'fee_credit_behavior' => $feeCreditBehavior,
+        'razorpay_fee_rupees' => $razorpayFeeRuples,
+        'payment_amount_recorded' => $paymentAmount,
+        'gateway_fee_recorded' => $gatewayFee
     ]);
-    
-    if ($actualPaymentAmount > $amount) {
-        $gatewayFee = $actualPaymentAmount - $amount;
-        
-        if ($feeMode === 'merchant_absorbs') {
-            // Merchant absorbs fee: record invoice amount, fee as separate field
-            $paymentAmount = $amount;
-            logRazorpayDebug('Merchant absorbs fee mode', [
-                'payment_amount' => $paymentAmount,
-                'gateway_fee' => $gatewayFee
-            ]);
-        } else {
-            // Client pays fee: record full payment amount
-            $paymentAmount = $actualPaymentAmount;
-            $gatewayFee = 0; // Don't record as separate fee since client paid it
-            logRazorpayDebug('Client pays fee mode', [
-                'payment_amount' => $paymentAmount,
-                'gateway_fee' => $gatewayFee
-            ]);
-        }
-    } elseif ($actualPaymentAmount > $amount * 0.995) {
-        // Small difference, likely client pays mode
-        $paymentAmount = $actualPaymentAmount;
-        $gatewayFee = 0;
-        logRazorpayDebug('Client pays mode detected', [
-            'payment_amount' => $paymentAmount,
-            'gateway_fee' => $gatewayFee
-        ]);
-    }
     
     // Apply fee credit behavior setting
     if ($feeCreditBehavior === 'disabled' && $gatewayFee > 0) {
@@ -575,7 +564,16 @@ try
         $feeCreditBehavior
     );
 
-    logTransaction($gatewayParams["name"], $_POST, "Successful"); # Save to Gateway Log: name, data array, status
+    // Avoid logging full POST payload (contains signature and other sensitive fields).
+    logTransaction($gatewayParams["name"], [
+        'merchant_order_id' => $merchant_order_id,
+        'razorpay_payment_id' => $razorpay_payment_id,
+        'razorpay_order_id' => $razorpay_order_id,
+        'signature_valid' => $signatureValid,
+        'fee_mode' => $feeMode,
+        'amount_recorded' => $paymentAmount,
+        'fees_recorded' => $gatewayFee,
+    ], "Successful");
 }
 catch (Errors\SignatureVerificationError $e)
 {
@@ -583,7 +581,13 @@ catch (Errors\SignatureVerificationError $e)
 
     # Unsuccessful
     # Save to Gateway Log: name, data array, status
-    logTransaction($gatewayParams["name"], $_POST, "Unsuccessful-".$error . ". Please check razorpay dashboard for Payment id: ".$_POST['razorpay_payment_id']);
+    logTransaction($gatewayParams["name"], [
+        'merchant_order_id' => $merchant_order_id,
+        'razorpay_payment_id' => $razorpay_payment_id,
+        'razorpay_order_id' => $razorpay_order_id,
+        'signature_valid' => $signatureValid,
+        'error' => $error,
+    ], "Unsuccessful-" . $error . ". Please check razorpay dashboard for Payment id: " . $razorpay_payment_id);
 }
 
 // PRG redirect with status parameter

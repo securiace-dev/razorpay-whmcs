@@ -164,6 +164,19 @@ function razorpay_config()
             ),
             'Description' => 'Controls whether gateway fees are automatically added as credit balance:<br/><strong>Disabled:</strong> Fees are recorded but not added as credit (Recommended)<br/><strong>Enabled:</strong> Fees are added as credit balance to client account',
         ),
+        'affordabilityWidgetEnabled' => array(
+            'FriendlyName' => 'Affordability Widget',
+            'Type' => 'yesno',
+            'Default' => '',
+            'Description' => 'Enable Razorpay Affordability Widget on client area pages. Themes must include a <code>&lt;div id=\"razorpay-affordability-widget\"&gt;</code> where the widget should appear.',
+        ),
+        'affordabilityWidgetKey' => array(
+            'FriendlyName' => 'Affordability Widget Key',
+            'Type' => 'text',
+            'Size' => '50',
+            'Default' => '',
+            'Description' => 'Razorpay API key to use for the Affordability Widget (usually your Checkout key id).',
+        ),
         'last_synced_at' => array(
             'FriendlyName' => 'Last Sync Timestamp',
             'Type' => 'text',
@@ -245,6 +258,21 @@ function createRazorpayOrderId(array $params)
         ),
     );
 
+    // Non-sensitive debug for auditing what amount is sent to Razorpay.
+    $feeMode = $params['feeMode'] ?? '';
+    logTransaction(
+        razorpay_MetaData()['DisplayName'],
+        [
+            'invoiceid' => $params['invoiceid'],
+            'amount_rupees' => $params['amount'],
+            'currency' => $params['currency'],
+            'payment_action' => $params['paymentAction'] ?? null,
+            'fee_mode' => $feeMode,
+            'whmcs_version' => $params['whmcsVersion'] ?? null,
+        ],
+        'Order Creation Params'
+    );
+
     try
     {
         $razorpayOrder = $api->order->create($data);
@@ -300,6 +328,44 @@ function getExistingOrderDetails($params, $razorpayOrderId)
     }
 
 }
+
+/**
+ * Normalize phone number for Razorpay checkout `data-prefill.contact`.
+ * Goal: reduce OTP/saved-card identity mismatches by providing E.164 (+91 for India).
+ *
+ * @param string $phone
+ * @return string Normalized contact string (digits with leading + when applicable)
+ */
+function normalizeRazorpayContact($phone)
+{
+    $phone = trim((string) $phone);
+    if ($phone === '') {
+        return '';
+    }
+
+    $digits = preg_replace('/\D+/', '', $phone);
+    if ($digits === null || $digits === '') {
+        return '';
+    }
+
+    // India local: 10 digits -> +91
+    if (strlen($digits) === 10) {
+        return '+91' . $digits;
+    }
+
+    // India E.164: 12 digits where prefix is 91
+    if (strlen($digits) === 12 && substr($digits, 0, 2) === '91') {
+        return '+' . $digits;
+    }
+
+    // Best-effort for other country formats
+    if (strlen($digits) > 10 && substr($digits, 0, 1) !== '0') {
+        return '+' . $digits;
+    }
+
+    return $digits;
+}
+
 /**
  * Payment link.
  * Required by third party payment gateway modules only.
@@ -331,7 +397,7 @@ function razorpay_link($params)
     // Client Parameters
     $name = $params['clientdetails']['firstname'].' '.$params['clientdetails']['lastname'];
     $email = $params['clientdetails']['email'];
-    $contact = $params['clientdetails']['phonenumber'];
+    $contact = normalizeRazorpayContact($params['clientdetails']['phonenumber'] ?? '');
 
     // System Parameters
     $whmcsVersion = $params['whmcsVersion'];

@@ -194,6 +194,44 @@ $gatewayModuleName = 'razorpay';
 // Fetch gateway configuration parameters.
 $gatewayParams = getGatewayVariables($gatewayModuleName);
 
+// Security: Only allow POST requests
+if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'POST') {
+    http_response_code(405);
+    header('Allow: POST');
+    exit('Method Not Allowed');
+}
+
+// Security: Basic body size limit to reduce DoS risk
+$post = file_get_contents('php://input');
+if (!is_string($post) || $post === '') {
+    http_response_code(400);
+    exit('Bad Request');
+}
+if (strlen($post) > 1024 * 1024) { // 1MB
+    http_response_code(413);
+    exit('Payload Too Large');
+}
+
+// Security: Simple rate limiting (best-effort; only when APCu is enabled)
+$clientIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+$rateLimitKey = 'razorpay_webhook_' . md5($clientIp);
+if (function_exists('apcu_fetch') && function_exists('apcu_store')) {
+    $rateLimitCount = apcu_fetch($rateLimitKey) ?: 0;
+    if ($rateLimitCount >= 60) { // 60 requests/minute/IP
+        logActivity('Razorpay Webhook Security: Rate limit exceeded for IP - ' . $clientIp);
+        http_response_code(429);
+        exit('Too Many Requests');
+    }
+    apcu_store($rateLimitKey, $rateLimitCount + 1, 60);
+}
+
+// Validate gateway configuration early (avoid notices and undefined index usage)
+if (empty($gatewayParams['keyId']) || empty($gatewayParams['keySecret'])) {
+    logActivity('Razorpay Webhook Config Error: Missing API keys');
+    http_response_code(500);
+    exit('Server Misconfigured');
+}
+
 $api = new Api($gatewayParams['keyId'], $gatewayParams['keySecret']);
 
 /**
@@ -213,24 +251,28 @@ $api = new Api($gatewayParams['keyId'], $gatewayParams['keySecret']);
  * @throws Exception
  */
 
-$post = file_get_contents('php://input');
-
 $data = json_decode($post, true);
 
 if (json_last_error() !== 0)
 {
-    return;
+    http_response_code(400);
+    exit('Invalid JSON');
 }
 
 $enabled = $gatewayParams['enableWebhook'];
 
-// CRITICAL: Log all webhook attempts for debugging
+// Log minimal webhook metadata (avoid logging full payload / PII)
 logTransaction($gatewayParams['name'], [
     'webhook_enabled' => $enabled,
     'event' => $data['event'] ?? 'unknown',
     'has_signature' => isset($_SERVER['HTTP_X_RAZORPAY_SIGNATURE']),
-    'raw_data' => $data
 ], 'Webhook Received');
+
+// Validate webhook structure early (avoid notices and junk processing)
+if (!validateWebhookData($data)) {
+    http_response_code(400);
+    exit('Bad Request');
+}
 
 if ($enabled === 'on' and
     (empty($data['event']) === false))
@@ -244,7 +286,9 @@ if ($enabled === 'on' and
         //
         if (empty($razorpayWebhookSecret) === true)
         {
-            return;
+            logActivity('Razorpay Webhook Config Error: Missing webhook secret');
+            http_response_code(500);
+            exit('Server Misconfigured');
         }
 
         try
@@ -257,17 +301,13 @@ if ($enabled === 'on' and
         }
         catch (Errors\SignatureVerificationError $e)
         {
-            $log = array(
-                'message'   => $e->getMessage(),
-                'data'      => $data,
-                'event'     => 'razorpay.whmcs.signature.verify_failed'
-            );
+            logTransaction($gatewayParams["name"], array(
+                'message' => $e->getMessage(),
+                'event' => $data['event'] ?? 'unknown',
+            ), "Unsuccessful-" . $e->getMessage());
 
-            logTransaction($gatewayParams["name"], $log, "Unsuccessful-".$e->getMessage());
-
-            header('HTTP/1.1 401 Unauthorized', true, 401);
-
-            return;
+            http_response_code(401);
+            exit('Unauthorized');
         }
 
         switch ($data['event'])
@@ -280,7 +320,9 @@ if ($enabled === 'on' and
             case REFUND_PROCESSED:
                 return refundProcessed($data, $gatewayParams);
             default:
-                return;
+                // Unknown event: acknowledge (avoid retries) but do nothing.
+                http_response_code(200);
+                exit('OK');
         }
     }
 }
@@ -292,6 +334,10 @@ else
         'event' => $data['event'] ?? 'unknown',
         'message' => 'Webhook processing disabled - payments will not be recorded!'
     ], 'Webhook Disabled Warning');
+
+    // Acknowledge to avoid repeated retries when intentionally disabled.
+    http_response_code(200);
+    exit('OK');
 }
 
 
@@ -315,6 +361,24 @@ function orderPaid(array $data, $gatewayParams)
     $orderId = $data['payload']['order']['entity']['notes']['whmcs_order_id'];
     $razorpayPaymentId = $data['payload']['payment']['entity']['id'];
     $razorpayOrderId = $data['payload']['order']['entity']['id'];
+
+    // Idempotency: if WHMCS already recorded this transaction, acknowledge and exit.
+    try {
+        $existingTxn = Capsule::table('tblaccounts')
+            ->where('transid', $razorpayPaymentId)
+            ->first();
+        if ($existingTxn) {
+            logTransaction($gatewayParams['name'], array(
+                'razorpay_payment_id' => $razorpayPaymentId,
+                'message' => 'Duplicate webhook delivery (transid already exists)'
+            ), 'Webhook Idempotent Skip');
+            http_response_code(200);
+            exit('OK');
+        }
+    } catch (Exception $e) {
+        // If idempotency check fails, continue (do not block payment recording)
+        logActivity('Razorpay Webhook Idempotency Check Error: ' . $e->getMessage());
+    }
 
     // Validate Callback Invoice ID.
     $merchant_order_id = checkCbInvoiceID($orderId, $gatewayParams['name']);
@@ -357,23 +421,31 @@ function orderPaid(array $data, $gatewayParams)
     $error = "";
     $error = 'The payment has failed.';
 
-    $amount = getOrderAmountAsInteger($order);
+    $expectedAmount = getOrderAmountAsInteger($order);
+    $actualAmount = (int) ($data['payload']['payment']['entity']['amount'] ?? 0);
+    $actualPaymentAmountRuplesFromPayload = $actualAmount / 100;
 
-    // Enhanced amount validation with better error messages
-    if($data['payload']['payment']['entity']['amount'] === $amount)
-    {
+    // Fee-bearer surcharge flows legitimately make the Razorpay payment amount higher than the WHMCS order amount.
+    // Allow that direction, but still fail on major underpayment.
+    $tolerance = max(1, (int) round($expectedAmount * 0.005)); // 0.5% tolerance in paise
+    if ($actualAmount + $tolerance >= $expectedAmount) {
         $success = true;
-    }
-    else
-    {
-        $error = 'WHMCS_ERROR: Payment to Razorpay Failed. Amount mismatch.';
-        logTransaction($gatewayParams['name'], "Amount mismatch: Expected $amount, Got " . $data['payload']['payment']['entity']['amount'], "Amount Mismatch");
+    } else {
+        $error = 'WHMCS_ERROR: Payment to Razorpay Failed. Amount underpayment.';
+        logTransaction(
+            $gatewayParams['name'],
+            "Amount underpayment: Expected $expectedAmount, Got $actualAmount, Tolerance $tolerance",
+            "Amount Mismatch"
+        );
     }
 
     $log = [
         'merchant_order_id'   => $orderId,
         'razorpay_payment_id' => $razorpayPaymentId,
         'razorpay_order_id' => $razorpayOrderId,
+        'expected_amount' => $expectedAmount,
+        'actual_amount' => $actualAmount,
+        'amount_diff' => ($actualAmount - $expectedAmount),
         'payment_created_at' => $data['payload']['payment']['entity']['created_at'],
         'webhook_received_at' => time(),
         'webhook' => true
@@ -384,43 +456,62 @@ function orderPaid(array $data, $gatewayParams)
         # Successful
         # Apply Payment to Invoice: invoiceid, transactionid, amount paid, fees, modulename
         $razorpayCreatedAt = $data['payload']['payment']['entity']['created_at'];
-        $orderAmount=$order['orders']['order'][0]['amount'];
+        $orderAmount = $order['orders']['order'][0]['amount'];
         
         // Handle gateway fees based on configuration
         $feeMode = $gatewayParams['feeMode'] ?? 'merchant_absorbs';
-        $paymentAmount = $orderAmount;
+        $paymentAmount = $orderAmount; // base by default (never include surcharge)
         $gatewayFee = 0;
-        
-        if ($feeMode === 'merchant_absorbs' || $feeMode === 'client_pays') {
-            // Get the actual payment amount from Razorpay to check for gateway fees
-            try {
-                $api = new \Razorpay\Api\Api($gatewayParams['keyId'], $gatewayParams['keySecret']);
-                $paymentDetails = $api->payment->fetch($razorpayPaymentId);
-                $actualPaymentAmount = $paymentDetails['amount'] / 100;
-                
-                // If payment amount is higher than order amount, it includes gateway fee
-                if ($actualPaymentAmount > $orderAmount) {
-                    $gatewayFee = $actualPaymentAmount - $orderAmount;
-                    // Record only the order amount as payment (gateway fee goes to Razorpay)
-                    $paymentAmount = $orderAmount;
-                }
-            } catch (Exception $e) {
-                // If we can't fetch payment details, use order amount
-                $paymentAmount = $orderAmount;
+        $razorpayFeeRuples = 0;
+
+        // Fetch Razorpay payment fee so we don't treat surcharge-inflated amount as “gateway fee”.
+        // (Razorpay’s UI/records can separate surcharge vs Razorpay fee.)
+        try {
+            $api = new \Razorpay\Api\Api($gatewayParams['keyId'], $gatewayParams['keySecret']);
+            $paymentDetails = $api->payment->fetch($razorpayPaymentId);
+
+            $actualPaymentAmountRuples = $paymentDetails['amount'] / 100;
+            if (isset($paymentDetails['fee']) && $paymentDetails['fee'] !== null) {
+                $razorpayFeeRuples = ((float) $paymentDetails['fee']) / 100;
+            } else {
+                // Fallback: if fee field is missing, treat difference as fee.
+                $razorpayFeeRuples = max(0, $actualPaymentAmountRuples - $orderAmount);
             }
+
+            if ($feeMode === 'client_pays') {
+                // Client pays everything: apply only the base order amount as payment, keep WHMCS fees as 0.
+                $paymentAmount = $orderAmount;
+                $gatewayFee = 0;
+            } else {
+                // Merchant absorbs: record base order amount and keep Razorpay fee in `fees`.
+                $paymentAmount = $orderAmount;
+                $gatewayFee = $razorpayFeeRuples;
+            }
+        } catch (Exception $e) {
+            // Fallback: always apply only the base order amount, regardless of fee mode.
+            $paymentAmount = $orderAmount;
+            $gatewayFee = 0;
+            $razorpayFeeRuples = 0;
         }
+
+        $log['fee_mode_config'] = $feeMode;
+        $log['razorpay_fee_rupees'] = $razorpayFeeRuples;
+        $log['amount_recorded_rupees'] = $paymentAmount;
+        $log['fees_recorded_rupees'] = $gatewayFee;
         
         // Convert Razorpay Unix timestamp to WHMCS datetime format (IST timezone)
         $paymentDate = RzpWhmcsCompat::tzConvertFromUnix($razorpayCreatedAt);
         
         // Use compatibility layer for payment recording
+        $feeCreditBehavior = $gatewayParams['feeCreditBehavior'] ?? 'disabled';
         $success = RzpWhmcsCompat::addPayment(
             $orderId,
             $razorpayPaymentId,
             $paymentAmount,
             $gatewayFee,
             'razorpay',
-            $paymentDate
+            $paymentDate,
+            $feeCreditBehavior
         );
         
         logTransaction($gatewayParams["name"], $log, "Successful"); # Save to Gateway Log: name, data array, status
@@ -502,7 +593,11 @@ function logWebhookError($message, $data = array(), $level = 'Error')
     
     $logData = array(
         'message' => $message,
-        'data' => $data,
+        // Avoid logging full webhook payload (can contain PII). Log only safe metadata.
+        'data' => array(
+            'event' => $data['event'] ?? null,
+            'has_payload' => isset($data['payload']),
+        ),
         'timestamp' => date('Y-m-d H:i:s'),
         'level' => $level
     );
